@@ -186,6 +186,47 @@ def main():
                 logging.error(f"Error processing customer data: {e}")
                 sys.exit(1)
 
+        def manage_final_day_stock(current_day, nodes, shipments_in_transit):
+            """Manage stock levels on the last days to avoid overflow."""
+            for node_id, node in nodes.items():
+                if node.type == "tank" and node.stock > (node.capacity * 0.9):
+                    # Find nearby customers with pending demands to reduce tank overflow
+                    excess_amount = node.stock - node.capacity
+                    logging.info(
+                        f"Day {current_day}: Excess stock {excess_amount:.2f} detected in tank {node_id}"
+                    )
+                    for demand in [d for d in demands if d.remaining_amount > 0]:
+                        if (
+                            demand.start_delivery_day
+                            <= current_day
+                            <= demand.end_delivery_day
+                        ):
+                            # Calculate the deliverable amount based on customer's intake capacity
+                            deliverable_amount = min(
+                                demand.remaining_amount,
+                                node.daily_output,
+                                excess_amount,
+                            )
+                            if deliverable_amount > 0:
+                                logging.info(
+                                    f"Shipping {deliverable_amount:.2f} units from {node_id} to customer {demand.customer_id}"
+                                )
+                                # Schedule movement to customer
+                                shipments_in_transit[current_day + 1] = (
+                                    shipments_in_transit.get(current_day + 1, [])
+                                )
+                                shipments_in_transit[current_day + 1].append(
+                                    {
+                                        "toNode": demand.customer_id,
+                                        "amount": deliverable_amount,
+                                    }
+                                )
+                                node.stock -= deliverable_amount
+                                demand.remaining_amount -= deliverable_amount
+                                excess_amount -= deliverable_amount
+                                if excess_amount <= 0:
+                                    break
+
         # Create connections dictionary
         connections = {}
         for _, row in connections_df.iterrows():
@@ -224,9 +265,22 @@ def main():
         demands: List[Demand] = []
         shipments_in_transit = {}
 
-        # Main game loop - 42 rounds starting from day 0
-        for current_day in range(43):  # 0 to 42 inclusive
+        active_demands = [d for d in demands if d.remaining_amount > 0]
+        logging.info(f"Active demands: {len(active_demands)}")
+        for demand in active_demands:
+            logging.info(
+                f"Demand {demand.id}: "
+                f"Customer={demand.customer_id}, "
+                f"Remaining={demand.remaining_amount}, "
+                f"Window={demand.start_delivery_day}-{demand.end_delivery_day}"
+            )
+
+        total_days = 42
+        for current_day in range(0, total_days + 1):  # 0 to 42 inclusive
             logging.info(f"\n{'='*20} Day {current_day} {'='*20}")
+
+            if current_day >= total_days - 5:
+                manage_final_day_stock(current_day, nodes, shipments_in_transit)
 
             # Process arriving shipments
             if current_day in shipments_in_transit:
@@ -240,32 +294,55 @@ def main():
                         )
                 del shipments_in_transit[current_day]
 
-            # Day 0 gets empty movements
-            if current_day == 0:
-                movements = []
-            else:
-                # Update refinery production
-                for node_id, node in nodes.items():
-                    if node.type == "refinery":
-                        production_rate = next(
-                            float(row["production"])
-                            for _, row in refineries_df.iterrows()
-                            if str(row["id"]) == node_id
-                        )
-                        node.stock += production_rate
+            # Update refinery production
+            for node_id, node in nodes.items():
+                if node.type == "refinery":
+                    # Retrieve the production rate for the refinery
+                    production_rate = next(
+                        float(row["production"])
+                        for _, row in refineries_df.iterrows()
+                        if str(row["id"]) == node_id
+                    )
+
+                    # Calculate remaining days
+                    remaining_days = total_days - current_day
+
+                    # If in the last 5 days, check capacity closely
+                    if remaining_days <= 5:
                         logging.info(
-                            f"Refinery {node_id} produced {production_rate:.2f} units"
+                            f"End-game phase: Day {current_day}, {remaining_days} days remaining"
                         )
+                        # Adjust production to avoid overflow
+                        available_capacity = node.capacity - node.stock
+                        adjusted_production = min(production_rate, available_capacity)
+                        if adjusted_production < production_rate:
+                            logging.info(
+                                f"Reducing production for refinery {node_id} from "
+                                f"{production_rate:.2f} to {adjusted_production:.2f} "
+                                f"due to end-game phase"
+                            )
+                        production_rate = adjusted_production
 
-                # Run optimization
-                optimizer = Optimizer(
-                    nodes=nodes,
-                    connections=connections,
-                    demands=[d for d in demands if d.remaining_amount > 0],
-                    current_day=current_day,
-                )
-                movements = optimizer.optimize()
+                    # Increase node stock with calculated production rate
+                    node.stock += production_rate
+                    logging.info(
+                        f"Refinery {node_id} produced {production_rate:.2f} units"
+                    )
 
+            # Create and run optimizer
+            active_demands = [d for d in demands if d.remaining_amount > 0]
+            logging.info(f"Optimizing for {len(active_demands)} active demands")
+
+            optimizer = Optimizer(
+                nodes=nodes,
+                connections=connections,
+                demands=active_demands,
+                current_day=current_day,
+                planning_horizon=7,
+            )
+
+            movements = optimizer.optimize()
+            logging.info(f"Optimizer generated {len(movements)} movements")
             # Submit movements to API
             day_response = api_client.play_round(current_day, movements)
             if day_response is None:
@@ -273,25 +350,35 @@ def main():
                 break
 
             # Process new demands from API response
+            # In main.py, modify the demand processing section:
             new_demands = day_response.get("demand", [])
             for demand_data in new_demands:
                 try:
                     demand = Demand(
-                        id=str(demand_data["id"]),
-                        customer_id=str(demand_data["customer_id"]),
-                        quantity=float(demand_data["quantity"]),
-                        post_day=int(demand_data["post_day"]),
-                        start_delivery_day=int(demand_data["start_delivery_day"]),
-                        end_delivery_day=int(demand_data["end_delivery_day"]),
+                        id=str(demand_data.get("customerId")),  # Changed from 'id'
+                        customer_id=str(demand_data.get("customerId")),
+                        quantity=float(
+                            demand_data.get("amount")
+                        ),  # Changed from 'quantity'
+                        post_day=int(
+                            demand_data.get("postDay")
+                        ),  # Changed from 'post_day'
+                        start_delivery_day=int(
+                            demand_data.get("startDay")
+                        ),  # Changed from 'start_delivery_day'
+                        end_delivery_day=int(
+                            demand_data.get("endDay")
+                        ),  # Changed from 'end_delivery_day'
                     )
                     demands.append(demand)
                     logging.info(
-                        f"New demand: Customer={demand.customer_id}, "
-                        f"Quantity={demand.quantity}, "
-                        f"Window={demand.start_delivery_day}-{demand.end_delivery_day}"
+                        f"New demand received: ID={demand.id}, Customer={demand.customer_id}, "
+                        f"Quantity={demand.quantity}, Window={demand.start_delivery_day}-{demand.end_delivery_day}"
                     )
-                except (KeyError, ValueError) as e:
-                    logging.error(f"Error processing demand data: {e}")
+                except (KeyError, ValueError, TypeError) as e:
+                    logging.error(
+                        f"Error processing demand data: {str(e)}, Data: {demand_data}"
+                    )
 
             # Process movements and schedule future arrivals
             for movement in movements:
@@ -345,4 +432,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
